@@ -1,0 +1,671 @@
+--==================================================
+-- ASTERIA HUB V2 (DELTA OPTIMIZED)
+-- Roblox - LocalScript / Executor
+--==================================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+--==================================================
+-- CONFIGURATION
+--==================================================
+
+local Config = {
+    BoxESP = false,
+    SkeletonESP = false,
+    ItemESP = false,
+    Warning = true,
+
+    ItemCategory = "All",
+
+    WarnDistance = 25,
+    WarnCooldown = 3.5,
+    UpdateInterval = 0.15,
+
+    MobTag = "AsteriaEnemy",
+    ItemTag = "AsteriaLoot",
+}
+
+local Mobs = {}
+local Items = {}
+
+local LastWarning = 0
+local Elapsed = 0
+
+--==================================================
+-- HELPERS
+--==================================================
+
+local function notify(message)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Asteria Hub",
+            Text = message,
+            Duration = 2
+        })
+    end)
+end
+
+local function isPlayerCharacter(model)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character == model then
+            return true
+        end
+    end
+    return false
+end
+
+local function getRoot(model)
+    return model:FindFirstChild("HumanoidRootPart")
+        or model.PrimaryPart
+        or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function findAdornee(object)
+    if object:IsA("BasePart") then
+        return object
+    end
+
+    if object:IsA("Tool") then
+        return object:FindFirstChild("Handle")
+            or object:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    if object:IsA("Model") then
+        return getRoot(object)
+    end
+
+    return nil
+end
+
+--==================================================
+-- BOX ESP
+--==================================================
+
+local function removeBox(record)
+    if record.box then
+        record.box:Destroy()
+        record.box = nil
+    end
+end
+
+local function updateBox(record)
+    local model = record.model
+
+    if not Config.BoxESP or not model.Parent then
+        removeBox(record)
+        return
+    end
+
+    local root = getRoot(model)
+
+    if not root then
+        removeBox(record)
+        return
+    end
+
+    local success, boxCF, boxSize = pcall(function()
+        return model:GetBoundingBox()
+    end)
+
+    if not success then
+        return
+    end
+
+    if not record.box then
+        local box = Instance.new("BoxHandleAdornment")
+
+        box.Name = "AsteriaBox"
+        box.Adornee = root
+        box.AlwaysOnTop = true
+        box.ZIndex = 5
+        box.Transparency = 0.15
+        box.Color3 = Color3.fromRGB(255, 40, 40)
+
+        box.Parent = root
+
+        record.box = box
+    end
+
+    record.box.Adornee = root
+    record.box.Size = boxSize
+    record.box.CFrame = root.CFrame:ToObjectSpace(boxCF)
+end
+
+--==================================================
+-- SKELETON ESP
+--==================================================
+
+local function clearSkeleton(record)
+    for _, object in ipairs(record.bones) do
+        if object and object.Parent then
+            object:Destroy()
+        end
+    end
+
+    table.clear(record.bones)
+end
+
+local function createBone(model, joint, record)
+    if not joint.Part0 or not joint.Part1 then
+        return
+    end
+
+    if not joint.Part0:IsDescendantOf(model)
+        or not joint.Part1:IsDescendantOf(model) then
+        return
+    end
+
+    local attachment0 = Instance.new("Attachment")
+    attachment0.Name = "AsteriaBoneA"
+    attachment0.CFrame = joint.C0
+    attachment0.Parent = joint.Part0
+
+    local attachment1 = Instance.new("Attachment")
+    attachment1.Name = "AsteriaBoneB"
+    attachment1.CFrame = joint.C1
+    attachment1.Parent = joint.Part1
+
+    local beam = Instance.new("Beam")
+    beam.Name = "AsteriaSkeletonLine"
+
+    beam.Attachment0 = attachment0
+    beam.Attachment1 = attachment1
+
+    beam.Width0 = 0.035
+    beam.Width1 = 0.035
+
+    beam.FaceCamera = true
+    beam.LightEmission = 0.7
+
+    beam.Color = ColorSequence.new(
+        Color3.fromRGB(255, 220, 40)
+    )
+
+    beam.Parent = model
+
+    table.insert(record.bones, attachment0)
+    table.insert(record.bones, attachment1)
+    table.insert(record.bones, beam)
+end
+
+local function buildSkeleton(record)
+    clearSkeleton(record)
+
+    local model = record.model
+
+    if not Config.SkeletonESP or not model.Parent then
+        return
+    end
+
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("Motor6D") then
+            createBone(model, object, record)
+        end
+    end
+end
+
+--==================================================
+-- MOB MANAGEMENT
+--==================================================
+
+local function refreshMob(record)
+    updateBox(record)
+
+    if Config.SkeletonESP then
+        if #record.bones == 0 then
+            buildSkeleton(record)
+        end
+    else
+        clearSkeleton(record)
+    end
+end
+
+local function removeMob(model)
+    local record = Mobs[model]
+
+    if not record then
+        return
+    end
+
+    if record.descendantConnection then
+        record.descendantConnection:Disconnect()
+    end
+
+    if record.ancestryConnection then
+        record.ancestryConnection:Disconnect()
+    end
+
+    removeBox(record)
+    clearSkeleton(record)
+
+    Mobs[model] = nil
+end
+
+local function registerMob(model)
+    if not model:IsA("Model") then
+        return
+    end
+
+    if isPlayerCharacter(model) or Mobs[model] then
+        return
+    end
+
+    local record = {
+        model = model,
+        box = nil,
+        bones = {},
+    }
+
+    Mobs[model] = record
+
+    record.descendantConnection =
+        model.DescendantAdded:Connect(function(object)
+            if object:IsA("Motor6D")
+                and Config.SkeletonESP then
+                buildSkeleton(record)
+            end
+        end)
+
+    record.ancestryConnection =
+        model.AncestryChanged:Connect(function(_, parent)
+            if not parent then
+                removeMob(model)
+            end
+        end)
+
+    refreshMob(record)
+end
+
+--==================================================
+-- ITEM ESP
+--==================================================
+
+local function matchesItem(object)
+    local name = object.Name:lower()
+    local category = Config.ItemCategory
+    local attribute = object:GetAttribute("ItemCategory")
+
+    if category == "All" then
+        return true
+    end
+
+    if category == "Loot" then
+        return attribute == "Loot"
+            or name:find("loot")
+            or name:find("steal")
+            or name:find("chest")
+            or name:find("box")
+    end
+
+    if category == "Weapon" then
+        return object:IsA("Tool")
+            or attribute == "Weapon"
+            or name:find("sword")
+            or name:find("weapon")
+            or name:find("gun")
+    end
+
+    if category == "Currency" then
+        return attribute == "Currency"
+            or name:find("coin")
+            or name:find("gem")
+            or name:find("money")
+            or name:find("diamond")
+            or name:find("gold")
+    end
+
+    return false
+end
+
+local function removeItem(record)
+    if record.gui then
+        record.gui:Destroy()
+        record.gui = nil
+    end
+end
+
+local function refreshItem(record)
+    local object = record.object
+
+    if not object.Parent then
+        removeItem(record)
+        return
+    end
+
+    if not Config.ItemESP or not matchesItem(object) then
+        removeItem(record)
+        return
+    end
+
+    local part = findAdornee(object)
+
+    if not part then
+        return
+    end
+
+    if record.gui then
+        record.gui.Adornee = part
+
+        local label = record.gui:FindFirstChild("Label")
+        if label then
+            label.Text = "◆ " .. object.Name
+        end
+
+        return
+    end
+
+    local gui = Instance.new("BillboardGui")
+
+    gui.Name = "AsteriaItemESP"
+    gui.Adornee = part
+    gui.Size = UDim2.fromOffset(160, 30)
+    gui.StudsOffset = Vector3.new(0, 2, 0)
+    gui.AlwaysOnTop = true
+    gui.MaxDistance = 250
+    gui.Parent = PlayerGui
+
+    local label = Instance.new("TextLabel")
+
+    label.Name = "Label"
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+
+    label.Text = "◆ " .. object.Name
+    label.TextColor3 = Color3.fromRGB(0, 255, 150)
+    label.TextStrokeTransparency = 0
+    label.TextSize = 14
+    label.Font = Enum.Font.GothamBold
+
+    label.Parent = gui
+
+    record.gui = gui
+end
+
+local function registerItem(object)
+    if Items[object] then
+        return
+    end
+
+    if not (
+        object:IsA("Model")
+        or object:IsA("BasePart")
+        or object:IsA("Tool")
+    ) then
+        return
+    end
+
+    local record = {
+        object = object,
+        gui = nil,
+    }
+
+    Items[object] = record
+
+    record.ancestryConnection =
+        object.AncestryChanged:Connect(function(_, parent)
+            if not parent then
+                if record.gui then
+                    record.gui:Destroy()
+                end
+
+                Items[object] = nil
+            end
+        end)
+
+    refreshItem(record)
+end
+
+--==================================================
+-- WARNING SYSTEM
+--==================================================
+
+local function updateWarnings()
+    if not Config.Warning then
+        return
+    end
+
+    local character = Player.Character
+
+    if not character then
+        return
+    end
+
+    local myRoot = getRoot(character)
+
+    if not myRoot then
+        return
+    end
+
+    local now = os.clock()
+
+    for model in pairs(Mobs) do
+        if model.Parent and not isPlayerCharacter(model) then
+            local humanoid =
+                model:FindFirstChildOfClass("Humanoid")
+
+            local mobRoot = getRoot(model)
+
+            if humanoid and humanoid.Health > 0 and mobRoot then
+                local distance =
+                    (myRoot.Position - mobRoot.Position).Magnitude
+
+                if distance <= Config.WarnDistance
+                    and now - LastWarning >= Config.WarnCooldown then
+
+                    LastWarning = now
+
+                    notify(
+                        model.Name .. " đang ở gần! "
+                        .. math.floor(distance) .. " studs!"
+                    )
+
+                    break
+                end
+            end
+        end
+    end
+end
+
+--==================================================
+-- UI
+--==================================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "AsteriaHub"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = PlayerGui
+
+local Main = Instance.new("Frame")
+Main.Size = UDim2.fromOffset(270, 285)
+Main.Position = UDim2.new(0, 20, 0.35, 0)
+Main.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
+Main.Parent = ScreenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = Main
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 45)
+title.BackgroundTransparency = 1
+title.Text = "ASTERIA HUB V2"
+title.TextColor3 = Color3.fromRGB(0, 220, 180)
+title.TextSize = 19
+title.Font = Enum.Font.GothamBold
+title.Parent = Main
+
+local function makeButton(text, y, callback)
+    local button = Instance.new("TextButton")
+
+    button.Size = UDim2.new(1, -20, 0, 36)
+    button.Position = UDim2.fromOffset(10, y)
+
+    button.BackgroundColor3 = Color3.fromRGB(43, 43, 55)
+    button.TextColor3 = Color3.new(1, 1, 1)
+
+    button.TextSize = 13
+    button.Font = Enum.Font.GothamSemibold
+    button.Text = text
+
+    button.Parent = Main
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = button
+
+    button.MouseButton1Click:Connect(callback)
+
+    return button
+end
+
+local function refreshAll()
+    for _, record in pairs(Mobs) do
+        refreshMob(record)
+    end
+
+    for _, record in pairs(Items) do
+        refreshItem(record)
+    end
+end
+
+local boxButton = makeButton("Box ESP: OFF", 50, function()
+    Config.BoxESP = not Config.BoxESP
+
+    boxButton.Text = "Box ESP: " ..
+        (Config.BoxESP and "ON" or "OFF")
+
+    refreshAll()
+end)
+
+local skeletonButton = makeButton("Skeleton ESP: OFF", 92, function()
+    Config.SkeletonESP = not Config.SkeletonESP
+
+    skeletonButton.Text = "Skeleton ESP: " ..
+        (Config.SkeletonESP and "ON" or "OFF")
+
+    refreshAll()
+end)
+
+local itemButton = makeButton("Item ESP: OFF", 134, function()
+    Config.ItemESP = not Config.ItemESP
+
+    itemButton.Text = "Item ESP: " ..
+        (Config.ItemESP and "ON" or "OFF")
+
+    refreshAll()
+end)
+
+local warningButton = makeButton("Warning: ON", 176, function()
+    Config.Warning = not Config.Warning
+
+    warningButton.Text = "Warning: " ..
+        (Config.Warning and "ON" or "OFF")
+end)
+
+local categories = {
+    {name = "All", label = "Tất cả vật phẩm"},
+    {name = "Loot", label = "Đồ cướp"},
+    {name = "Weapon", label = "Vũ khí"},
+    {name = "Currency", label = "Tiền / Kim cương"},
+}
+
+local categoryIndex = 1
+
+local categoryButton = makeButton(
+    "Danh mục: Tất cả vật phẩm",
+    218,
+    function()
+        categoryIndex = categoryIndex % #categories + 1
+
+        Config.ItemCategory = categories[categoryIndex].name
+
+        categoryButton.Text =
+            "Danh mục: " .. categories[categoryIndex].label
+
+        refreshAll()
+    end
+)
+
+--==================================================
+-- AUTOMATIC ENTITY DISCOVERY (DELTA FIX)
+--==================================================
+
+for _, model in ipairs(CollectionService:GetTagged(Config.MobTag)) do
+    registerMob(model)
+end
+
+for _, object in ipairs(CollectionService:GetTagged(Config.ItemTag)) do
+    registerItem(object)
+end
+
+CollectionService:GetInstanceAddedSignal(Config.MobTag)
+    :Connect(registerMob)
+
+CollectionService:GetInstanceRemovedSignal(Config.MobTag)
+    :Connect(removeMob)
+
+CollectionService:GetInstanceAddedSignal(Config.ItemTag)
+    :Connect(registerItem)
+
+CollectionService:GetInstanceRemovedSignal(Config.ItemTag)
+    :Connect(function(object)
+        local record = Items[object]
+
+        if record then
+            if record.ancestryConnection then
+                record.ancestryConnection:Disconnect()
+            end
+
+            removeItem(record)
+            Items[object] = nil
+        end
+    end)
+
+-- Fallback/Auto-scan workspace for Steal or Die compatibility
+task.spawn(function()
+    while true do
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+                if not isPlayerCharacter(obj) and obj ~= Player.Character then
+                    registerMob(obj)
+                end
+            elseif obj:IsA("Tool") or (obj:IsA("BasePart") and (obj:FindFirstChildOfClass("ProximityPrompt") or obj.Name:lower():find("item") or obj.Name:lower():find("steal") or obj.Name:lower():find("loot"))) then
+                registerItem(obj)
+            end
+        end
+        task.wait(2)
+    end
+end)
+
+--==================================================
+-- OPTIMIZED UPDATE LOOP
+--==================================================
+
+RunService.Heartbeat:Connect(function(dt)
+    Elapsed += dt
+
+    if Elapsed < Config.UpdateInterval then
+        return
+    end
+
+    Elapsed = 0
+
+    for _, record in pairs(Mobs) do
+        refreshMob(record)
+    end
+
+    for _, record in pairs(Items) do
+        refreshItem(record)
+    end
+
+    updateWarnings()
+end)
+
+notify("Asteria Hub V2 initialized!")
